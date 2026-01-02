@@ -56,3 +56,4 @@ def ensure_permission() -> None:
     print("Screen Recording permission granted.")
 
 
+
