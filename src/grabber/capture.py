@@ -10,7 +10,6 @@ try:
     from Foundation import NSObject
     import ScreenCaptureKit
     import CoreMedia
-    import Quartz
 except ImportError as e:
     print(f"Error importing macOS frameworks: {e}", file=sys.stderr)
     sys.exit(1)
@@ -62,6 +61,7 @@ class StreamOutput(NSObject):
         self._audio_callback: Optional[AudioCallback] = None
         self._sample_rate: int = 48000
         self._channels: int = 2
+        self._format_logged: bool = False
         return self
     
     def setAudioCallback_(self, callback: AudioCallback) -> None:
@@ -108,6 +108,48 @@ class StreamOutput(NSObject):
             if not CoreMedia.CMSampleBufferIsValid(sample_buffer):
                 return None
             
+            # Get format description to understand the audio format
+            format_desc = CoreMedia.CMSampleBufferGetFormatDescription(sample_buffer)
+            if format_desc is None:
+                return None
+            
+            # Get the audio stream basic description
+            # Returns a tuple: (mSampleRate, mFormatID, mFormatFlags, mBytesPerPacket,
+            #                   mFramesPerPacket, mBytesPerFrame, mChannelsPerFrame,
+            #                   mBitsPerChannel, mReserved)
+            asbd = CoreMedia.CMAudioFormatDescriptionGetStreamBasicDescription(format_desc)
+            if asbd is None:
+                return None
+            
+            # Extract format info from tuple
+            # Handle both tuple and struct-like object
+            if isinstance(asbd, tuple):
+                actual_sample_rate = asbd[0]  # mSampleRate
+                format_flags = asbd[2]        # mFormatFlags
+                bytes_per_frame = asbd[5]     # mBytesPerFrame
+                actual_channels = asbd[6]     # mChannelsPerFrame
+                bits_per_channel = asbd[7]    # mBitsPerChannel
+            else:
+                actual_sample_rate = asbd.mSampleRate
+                format_flags = asbd.mFormatFlags
+                bytes_per_frame = asbd.mBytesPerFrame
+                actual_channels = asbd.mChannelsPerFrame
+                bits_per_channel = asbd.mBitsPerChannel
+            
+            # Log format info once for debugging
+            if not self._format_logged:
+                is_float = (format_flags & 1) != 0
+                is_non_interleaved = (format_flags & 32) != 0
+                num_samples = CoreMedia.CMSampleBufferGetNumSamples(sample_buffer)
+                block_buffer = CoreMedia.CMSampleBufferGetDataBuffer(sample_buffer)
+                data_len = CoreMedia.CMBlockBufferGetDataLength(block_buffer) if block_buffer else 0
+                print(f"\n[Audio Format] Sample Rate: {actual_sample_rate} Hz, "
+                      f"Channels: {actual_channels}, Bits: {bits_per_channel}, "
+                      f"Float: {is_float}, Non-Interleaved: {is_non_interleaved}, "
+                      f"BytesPerFrame: {bytes_per_frame}, "
+                      f"NumSamples: {num_samples}, DataLength: {data_len}")
+                self._format_logged = True
+            
             # Get the audio buffer list
             block_buffer = CoreMedia.CMSampleBufferGetDataBuffer(sample_buffer)
             if block_buffer is None:
@@ -118,9 +160,10 @@ class StreamOutput(NSObject):
             if data_length == 0:
                 return None
             
-            # Create a buffer to copy data into
-            # CMBlockBufferCopyDataBytes(buffer, offsetToData, dataLength, destination)
-            # destination is an "out" parameter that will receive the bytes
+            # Get number of samples
+            num_samples = CoreMedia.CMSampleBufferGetNumSamples(sample_buffer)
+            
+            # Copy data bytes
             status, data_bytes = CoreMedia.CMBlockBufferCopyDataBytes(
                 block_buffer,
                 0,  # offset
@@ -134,17 +177,48 @@ class StreamOutput(NSObject):
             if data_bytes is None:
                 return None
             
-            # Convert bytes to numpy array (assuming float32 PCM from ScreenCaptureKit)
-            audio_array = np.frombuffer(data_bytes, dtype=np.float32).copy()
+            # ScreenCaptureKit delivers audio as Float32, non-interleaved (planar)
+            # kAudioFormatFlagIsFloat = 1, kAudioFormatFlagIsNonInterleaved = 32
+            is_float = (format_flags & 1) != 0
+            is_non_interleaved = (format_flags & 32) != 0
             
-            # Reshape to stereo if needed
-            if self._channels == 2 and len(audio_array) % 2 == 0:
-                audio_array = audio_array.reshape(-1, 2)
+            if is_float and bits_per_channel == 32:
+                # Float32 audio
+                audio_array = np.frombuffer(data_bytes, dtype=np.float32).copy()
+            elif bits_per_channel == 16:
+                # Int16 audio
+                audio_array = np.frombuffer(data_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+            else:
+                # Assume float32
+                audio_array = np.frombuffer(data_bytes, dtype=np.float32).copy()
+            
+            # Handle channel layout
+            actual_channels = int(actual_channels)
+            if actual_channels == 2:
+                if is_non_interleaved:
+                    # Non-interleaved: [L L L L...][R R R R...]
+                    # Need to interleave for WAV format
+                    half = len(audio_array) // 2
+                    left = audio_array[:half]
+                    right = audio_array[half:]
+                    audio_array = np.column_stack((left, right))
+                else:
+                    # Already interleaved: [L R L R L R...]
+                    audio_array = audio_array.reshape(-1, 2)
+            elif actual_channels == 1:
+                # Mono - keep as is
+                pass
+            else:
+                # Multi-channel - reshape
+                if len(audio_array) % actual_channels == 0:
+                    audio_array = audio_array.reshape(-1, actual_channels)
             
             return audio_array
             
         except Exception as e:
             print(f"Error extracting audio: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc()
             return None
 
 
@@ -275,6 +349,30 @@ class AudioCapture:
         
         print(f"Starting audio capture from: {self.application.applicationName()}")
         
+        # Retry logic for transient errors
+        max_retries = 3
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                self._start_capture()
+                return  # Success
+            except RuntimeError as e:
+                last_error = e
+                error_str = str(e)
+                # Error -3818 is often transient
+                if "-3818" in error_str and attempt < max_retries - 1:
+                    print(f"Retry {attempt + 1}/{max_retries} after transient error...")
+                    import time
+                    time.sleep(1)
+                    continue
+                raise
+        
+        if last_error:
+            raise last_error
+    
+    def _start_capture(self) -> None:
+        """Internal method to start capture."""
         # Create the content filter
         content_filter = self._create_content_filter()
         
@@ -297,7 +395,15 @@ class AudioCapture:
         self._stream_output.setAudioCallback_(self._on_audio_data)
         self._stream_output.setAudioFormat_channels_(self.sample_rate, self.channels)
         
-        # Add the output handler for audio (use None for main queue)
+        # Add screen output first (required on some macOS versions for audio to work)
+        screen_error = self._stream.addStreamOutput_type_sampleHandlerQueue_error_(
+            self._stream_output,
+            ScreenCaptureKit.SCStreamOutputTypeScreen,
+            None,
+            None,
+        )
+        
+        # Add the output handler for audio
         error_result = self._stream.addStreamOutput_type_sampleHandlerQueue_error_(
             self._stream_output,
             ScreenCaptureKit.SCStreamOutputTypeAudio,
