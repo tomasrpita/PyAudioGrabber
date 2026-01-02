@@ -10,6 +10,7 @@ try:
     from Foundation import NSObject
     import ScreenCaptureKit
     import CoreMedia
+    import Quartz
 except ImportError as e:
     print(f"Error importing macOS frameworks: {e}", file=sys.stderr)
     sys.exit(1)
@@ -17,6 +18,34 @@ except ImportError as e:
 
 # Type alias for audio callback
 AudioCallback = Callable[[np.ndarray], None]
+
+
+# Try to import libdispatch for creating dispatch queues
+try:
+    from libdispatch import dispatch_queue_create, DISPATCH_QUEUE_SERIAL
+    HAS_LIBDISPATCH = True
+except ImportError:
+    HAS_LIBDISPATCH = False
+
+
+def create_dispatch_queue(name: bytes):
+    """Create a serial dispatch queue, or return None if not available."""
+    if HAS_LIBDISPATCH:
+        return dispatch_queue_create(name, DISPATCH_QUEUE_SERIAL)
+    
+    # Try using objc runtime to create a queue
+    try:
+        import ctypes
+        libdispatch = ctypes.CDLL('/usr/lib/system/libdispatch.dylib')
+        
+        # dispatch_queue_create(const char *label, dispatch_queue_attr_t attr)
+        libdispatch.dispatch_queue_create.argtypes = [ctypes.c_char_p, ctypes.c_void_p]
+        libdispatch.dispatch_queue_create.restype = ctypes.c_void_p
+        
+        queue = libdispatch.dispatch_queue_create(name, None)
+        return objc.objc_object(c_void_p=queue) if queue else None
+    except Exception:
+        return None
 
 
 class StreamOutput(NSObject):
@@ -84,49 +113,29 @@ class StreamOutput(NSObject):
             if block_buffer is None:
                 return None
             
-            # Get the raw data
+            # Get the raw data length
             data_length = CoreMedia.CMBlockBufferGetDataLength(block_buffer)
             if data_length == 0:
                 return None
             
-            # Extract bytes from block buffer
-            data_bytes = CoreMedia.CMBlockBufferCreateContiguousWithData_(
-                None, block_buffer, None, None, 0, data_length, 0
+            # Create a buffer to copy data into
+            # CMBlockBufferCopyDataBytes(buffer, offsetToData, dataLength, destination)
+            # destination is an "out" parameter that will receive the bytes
+            status, data_bytes = CoreMedia.CMBlockBufferCopyDataBytes(
+                block_buffer,
+                0,  # offset
+                data_length,
+                None,  # destination - PyObjC will create it
             )
             
+            if status != 0:  # noErr is 0
+                return None
+            
             if data_bytes is None:
-                # Try alternative method to get data pointer
-                result = CoreMedia.CMBlockBufferGetDataPointer(
-                    block_buffer, 0, None, None, None
-                )
-                if result[0] != 0:  # noErr
-                    return None
-                
-                data_ptr = result[1]
-                if data_ptr is None:
-                    return None
-                
-                # Convert to numpy array (assuming float32 PCM)
-                audio_array = np.frombuffer(
-                    data_ptr[:data_length],
-                    dtype=np.float32,
-                )
-            else:
-                # Get data from contiguous buffer
-                result = CoreMedia.CMBlockBufferGetDataPointer(
-                    data_bytes[1], 0, None, None, None
-                )
-                if result[0] != 0:
-                    return None
-                
-                data_ptr = result[1]
-                if data_ptr is None:
-                    return None
-                
-                audio_array = np.frombuffer(
-                    data_ptr[:data_length],
-                    dtype=np.float32,
-                )
+                return None
+            
+            # Convert bytes to numpy array (assuming float32 PCM from ScreenCaptureKit)
+            audio_array = np.frombuffer(data_bytes, dtype=np.float32).copy()
             
             # Reshape to stereo if needed
             if self._channels == 2 and len(audio_array) % 2 == 0:
@@ -203,13 +212,7 @@ class AudioCapture:
     
     def _create_content_filter(self) -> "ScreenCaptureKit.SCContentFilter":
         """Create a content filter for the target application."""
-        # Create filter that only includes the target application
-        filter_ = ScreenCaptureKit.SCContentFilter.alloc().initWithDesktopIndependentWindow_(
-            None
-        )
-        
-        # We need to create a filter for the application
-        # Get all windows of the application
+        # We need to get shareable content to create the filter
         result = {"content": None, "error": None}
         event = threading.Event()
         
@@ -228,21 +231,12 @@ class AudioCapture:
         
         content = result["content"]
         
-        # Find windows belonging to our application
-        app_windows = []
-        target_pid = self.application.processID()
-        
-        for window in content.windows():
-            if window.owningApplication() and window.owningApplication().processID() == target_pid:
-                app_windows.append(window)
-        
-        # Create filter including only this application's content
-        # Use display filter with app exclusion inverted (include only this app)
+        # Get displays
         displays = content.displays()
         if not displays:
             raise RuntimeError("No displays available")
         
-        # Create a filter that includes the application
+        # Create a filter that includes only this application
         filter_ = (
             ScreenCaptureKit.SCContentFilter.alloc()
             .initWithDisplay_includingApplications_exceptingWindows_(
@@ -266,9 +260,9 @@ class AudioCapture:
         # Exclude audio from our own process
         config.setExcludesCurrentProcessAudio_(True)
         
-        # Disable video capture (we only want audio)
-        config.setWidth_(1)
-        config.setHeight_(1)
+        # Minimal video configuration (we only want audio, but SCStream requires some video config)
+        config.setWidth_(2)
+        config.setHeight_(2)
         config.setMinimumFrameInterval_(CoreMedia.CMTimeMake(1, 1))  # 1 FPS minimum
         config.setShowsCursor_(False)
         
@@ -303,28 +297,35 @@ class AudioCapture:
         self._stream_output.setAudioCallback_(self._on_audio_data)
         self._stream_output.setAudioFormat_channels_(self.sample_rate, self.channels)
         
-        # Add the output handler for audio
-        error_ptr = None
-        success = self._stream.addStreamOutput_type_sampleHandlerQueue_error_(
+        # Add the output handler for audio (use None for main queue)
+        error_result = self._stream.addStreamOutput_type_sampleHandlerQueue_error_(
             self._stream_output,
             ScreenCaptureKit.SCStreamOutputTypeAudio,
-            None,  # Use default queue
-            error_ptr,
+            None,  # Use main queue
+            None,
         )
         
-        if not success:
+        # Check for error in result
+        if isinstance(error_result, tuple):
+            if len(error_result) > 1 and error_result[1]:
+                raise RuntimeError(f"Failed to add stream output: {error_result[1]}")
+        elif error_result is False:
             raise RuntimeError("Failed to add stream output")
         
         # Start capturing
-        result = {"error": None}
+        result = {"error": None, "completed": False}
         event = threading.Event()
         
         def start_handler(error):
             result["error"] = error
+            result["completed"] = True
             event.set()
         
         self._stream.startCaptureWithCompletionHandler_(start_handler)
-        event.wait(timeout=10.0)
+        
+        # Wait for start to complete
+        if not event.wait(timeout=10.0):
+            raise RuntimeError("Timeout waiting for capture to start")
         
         if result["error"]:
             raise RuntimeError(f"Failed to start capture: {result['error']}")
@@ -350,14 +351,17 @@ class AudioCapture:
         print("\nStopping audio capture...")
         
         if self._stream:
-            result = {"error": None}
+            result = {"error": None, "completed": False}
             event = threading.Event()
             
             def stop_handler(error):
                 result["error"] = error
+                result["completed"] = True
                 event.set()
             
             self._stream.stopCaptureWithCompletionHandler_(stop_handler)
+            
+            # Wait for stop to complete
             event.wait(timeout=5.0)
             
             if result["error"]:
@@ -386,6 +390,3 @@ class AudioCapture:
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         """Context manager exit."""
         self.stop()
-
-
-

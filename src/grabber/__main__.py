@@ -5,6 +5,20 @@ import sys
 import time
 from pathlib import Path
 
+# Initialize macOS frameworks BEFORE any other imports that use them
+# This is required to avoid CGS_REQUIRE_INIT assertion failures
+try:
+    from AppKit import NSApplication, NSApp
+    from Foundation import NSRunLoop, NSDate
+    from PyObjCTools import AppHelper
+    
+    # Create the application instance (required for ScreenCaptureKit)
+    app = NSApplication.sharedApplication()
+except ImportError as e:
+    print(f"Error: Could not initialize macOS frameworks: {e}", file=sys.stderr)
+    print("Make sure pyobjc-framework-Cocoa is installed.", file=sys.stderr)
+    sys.exit(1)
+
 from .cli import parse_args, get_output_filepath, SUPPORTED_BROWSERS
 from .permissions import ensure_permission
 from .process import find_browser, list_running_browsers
@@ -15,21 +29,14 @@ from .writer import AudioWriter
 # Global references for signal handler
 _capture = None
 _writer = None
+_should_stop = False
 
 
 def signal_handler(signum, frame):
     """Handle Ctrl+C gracefully."""
-    global _capture, _writer
-    
+    global _should_stop
+    _should_stop = True
     print("\n\nInterrupted by user...")
-    
-    if _capture:
-        _capture.stop()
-    
-    if _writer:
-        _writer.stop()
-    
-    sys.exit(0)
 
 
 def print_banner():
@@ -42,9 +49,39 @@ def print_banner():
     print()
 
 
+def run_capture_loop(capture: AudioCapture, writer: AudioWriter) -> int:
+    """Run the main capture loop with NSRunLoop integration."""
+    global _should_stop
+    
+    print("\nRecording... Press Ctrl+C to stop.\n")
+    
+    run_loop = NSRunLoop.currentRunLoop()
+    last_print_time = time.time()
+    
+    while capture.is_running() and not _should_stop:
+        # Run the run loop for a short interval to process events
+        run_loop.runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(0.1))
+        
+        # Print progress every 0.5 seconds
+        current_time = time.time()
+        if current_time - last_print_time >= 0.5:
+            duration = writer.get_duration()
+            frames = writer.get_frames_written()
+            sys.stdout.write(f"\r  Duration: {duration:.1f}s | Frames: {frames:,}    ")
+            sys.stdout.flush()
+            last_print_time = current_time
+        
+        # Check for errors
+        if capture.get_error():
+            print(f"\nCapture error: {capture.get_error()}")
+            return 1
+    
+    return 0
+
+
 def main():
     """Main entry point."""
-    global _capture, _writer
+    global _capture, _writer, _should_stop
     
     print_banner()
     
@@ -101,36 +138,24 @@ def main():
         audio_callback=_writer.write,
     )
     
+    result = 0
+    
     try:
         # Start capturing
         _writer.start()
         _capture.start()
         
-        # Keep running until interrupted
-        print("\nRecording... Press Ctrl+C to stop.\n")
-        
-        while _capture.is_running():
-            # Print progress
-            duration = _writer.get_duration()
-            frames = _writer.get_frames_written()
-            
-            # Simple progress indicator
-            sys.stdout.write(f"\r  Duration: {duration:.1f}s | Frames: {frames:,}")
-            sys.stdout.flush()
-            
-            time.sleep(0.5)
-            
-            # Check for errors
-            if _capture.get_error():
-                print(f"\nCapture error: {_capture.get_error()}")
-                break
+        # Run the capture loop
+        result = run_capture_loop(_capture, _writer)
     
     except KeyboardInterrupt:
         print("\n\nStopping...")
     
     except Exception as e:
         print(f"\nError: {e}", file=sys.stderr)
-        return 1
+        import traceback
+        traceback.print_exc()
+        result = 1
     
     finally:
         # Clean up
@@ -140,11 +165,8 @@ def main():
         if _writer:
             _writer.stop()
     
-    return 0
+    return result
 
 
 if __name__ == "__main__":
     sys.exit(main())
-
-
-
