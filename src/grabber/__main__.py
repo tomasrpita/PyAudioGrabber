@@ -21,7 +21,7 @@ except ImportError as e:
 
 from .cli import parse_args, get_output_filepath, SUPPORTED_BROWSERS
 from .permissions import ensure_permission
-from .process import find_browser, list_running_browsers
+from .process import find_browser, find_application_by_pid, list_running_browsers
 from .capture import AudioCapture
 from .writer import AudioWriter
 
@@ -107,10 +107,18 @@ def main():
     # Check permissions
     ensure_permission()
     
-    # Find the target browser
-    browser_app = find_browser(args.browser)
-    if not browser_app:
-        return 1
+    # Find the target browser or application by PID
+    if args.pid:
+        print(f"Looking for process with PID: {args.pid}...")
+        browser_app = find_application_by_pid(args.pid)
+        if not browser_app:
+            print(f"Error: Could not find application with PID {args.pid}", file=sys.stderr)
+            return 1
+        print(f"Found: {browser_app.applicationName()} (PID: {browser_app.processID()})")
+    else:
+        browser_app = find_browser(args.browser)
+        if not browser_app:
+            return 1
     
     # Get output file path
     output_path = get_output_filepath(args)

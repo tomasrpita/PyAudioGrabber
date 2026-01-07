@@ -82,6 +82,52 @@ def find_running_application(bundle_id: str) -> Optional["SCRunningApplication"]
             return app
     
     return None
+    
+def find_application_by_pid(pid: int) -> Optional["SCRunningApplication"]:
+    """
+    Find a running application by its PID using ScreenCaptureKit.
+    
+    Args:
+        pid: The process ID.
+        
+    Returns:
+        SCRunningApplication object if found, None otherwise.
+    """
+    try:
+        import ScreenCaptureKit
+    except ImportError:
+        return None
+        
+    result = {"content": None, "error": None}
+    event = threading.Event()
+    
+    def completion_handler(content, error):
+        result["content"] = content
+        result["error"] = error
+        event.set()
+        
+    # Retry a few times as SCKit might need a moment to see the new process
+    for _ in range(3):
+        ScreenCaptureKit.SCShareableContent.getShareableContentWithCompletionHandler_(
+            completion_handler
+        )
+        event.wait(timeout=10.0)
+        
+        if result["error"] or not result["content"]:
+            event.clear()
+            import time
+            time.sleep(1)
+            continue
+            
+        for app in result["content"].applications():
+            if app.processID() == pid:
+                return app
+        
+        event.clear()
+        import time
+        time.sleep(1)
+            
+    return None
 
 
 def find_browser(browser_name: str) -> Optional["SCRunningApplication"]:

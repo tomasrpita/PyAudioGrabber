@@ -50,6 +50,12 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--pid",
+        type=int,
+        help="Specific Process ID (PID) to capture audio from. If provided, --browser is ignored.",
+    )
+
+    parser.add_argument(
         "--bitrate",
         type=str,
         default="192k",
